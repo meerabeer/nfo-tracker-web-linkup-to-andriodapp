@@ -104,6 +104,18 @@ export default function HomePage() {
     loadData();
   }, []);
 
+  const areas = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          nfos
+            .map((row) => row.home_location)
+            .filter((x): x is string => !!x && x.trim() !== "")
+        )
+      ),
+    [nfos]
+  );
+
   if (loading) {
     return (
       <main className="min-h-screen flex items-center justify-center">
