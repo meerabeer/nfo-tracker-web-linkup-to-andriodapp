@@ -111,13 +111,12 @@ export function findNearestSite(
 }
 
 /**
- * Build a human-readable distance label like we had in the legacy HTML:
- *  - ">200 km (check site GPS or NFO GPS)" when far
- *  - "12.34 km"
+ * Build a human-readable distance label.
+ * Returns the distance in km with 2 decimal places.
+ * No limitations on maximum distance.
  */
 export function formatDistanceLabel(distanceKm: number): string {
   if (!Number.isFinite(distanceKm)) return "N/A";
-  if (distanceKm > 200) return ">200 km (check site GPS or NFO GPS)";
   return `${distanceKm.toFixed(2)} km`;
 }
 

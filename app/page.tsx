@@ -83,21 +83,63 @@ export default function HomePage() {
 
         const rows = (data ?? []) as NfoStatusRow[];
 
-        // 1b) Load Site_Coordinates
-        const { data: siteRows, error: siteError } = await supabase
-          .from("Site_Coordinates")
-          .select("site_id, site_name, latitude, longitude, area");
+        // 1b) Load Site_Coordinates - fetch ALL sites using pagination
+        // Supabase default limit is 1000 rows, so we need to paginate to get all ~3516 sites
+        let allSiteRows: any[] = [];
+        let pageNumber = 0;
+        const PAGE_SIZE = 1000;
+        let hasMoreRows = true;
 
-        if (siteError) throw siteError;
+        while (hasMoreRows) {
+          const start = pageNumber * PAGE_SIZE;
+          const end = start + PAGE_SIZE - 1;
+          
+          const { data: siteRowsPage, error: siteError } = await supabase
+            .from("Site_Coordinates")
+            .select("site_id, site_name, latitude, longitude, area")
+            .range(start, end);
+
+          if (siteError) throw siteError;
+
+          if (!siteRowsPage || siteRowsPage.length === 0) {
+            hasMoreRows = false;
+            break;
+          }
+
+          allSiteRows = allSiteRows.concat(siteRowsPage);
+          
+          // If we got less than PAGE_SIZE rows, we've reached the end
+          if (siteRowsPage.length < PAGE_SIZE) {
+            hasMoreRows = false;
+          }
+
+          pageNumber++;
+        }
+
+        console.log("Site rows from Supabase:", allSiteRows.length, "rows (fetched across", pageNumber, "pages)");
+        if (allSiteRows && allSiteRows.length > 0) {
+          console.log("First site row:", allSiteRows[0]);
+        }
 
         const siteRecords: SiteRecord[] =
-          (siteRows ?? []).map((row: any) => ({
-            site_id: row.site_id,
-            name: row.site_name ?? null,
-            latitude: row.latitude,
-            longitude: row.longitude,
-            area: row.area ?? null,
-          })) ?? [];
+          (allSiteRows ?? []).map((row: any) => {
+            // Parse latitude and longitude from strings to numbers
+            const lat = typeof row.latitude === "string" ? parseFloat(row.latitude) : row.latitude;
+            const lng = typeof row.longitude === "string" ? parseFloat(row.longitude) : row.longitude;
+            return {
+              site_id: row.site_id,
+              name: row.site_name ?? null,
+              latitude: Number.isFinite(lat) ? lat : null,
+              longitude: Number.isFinite(lng) ? lng : null,
+              area: row.area ?? null,
+            };
+          }) ?? [];
+        
+        console.log("Parsed site records:", siteRecords.length, "records");
+        if (siteRecords.length > 0) {
+          console.log("First parsed site:", siteRecords[0]);
+        }
+        
         setSites(siteRecords);
 
         // 2) Keep only latest row per username
@@ -350,6 +392,18 @@ export default function HomePage() {
         }
       }
 
+      if (nfo.username === "ZAMEBIR") {
+        console.log("[Dashboard DISTANCE DEBUG]", {
+          username: nfo.username,
+          status: nfo.status,
+          site_id: nfo.site_id,
+          nfoLat: nfo.lat,
+          nfoLng: nfo.lng,
+          nearestSiteId: nearestSiteId ?? null,
+          nearestSiteDistanceKm,
+        });
+      }
+
       return {
         ...nfo,
         isOnline: online,
@@ -394,8 +448,8 @@ export default function HomePage() {
           {[
             { id: "dashboard", label: "Dashboard" },
             { id: "map", label: "Live map" },
-            { id: "routes", label: "NFO routes" },
-            { id: "settings", label: "Settings" },
+            // { id: "routes", label: "NFO routes" },  // Hidden from sidebar
+            // { id: "settings", label: "Settings" }, // Hidden from sidebar
           ].map((item) => (
             <button
               key={item.id}
