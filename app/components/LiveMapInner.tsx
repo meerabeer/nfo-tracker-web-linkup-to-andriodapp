@@ -17,9 +17,23 @@ import {
 
 const PAGE_SIZE = 1000;
 
+/**
+ * Props for LiveMapInner component.
+ * 
+ * MAP STATE PERSISTENCE:
+ * - `mapAreaFilter` and `mapNfoFilter` are controlled by parent (page.tsx)
+ * - These are persisted to localStorage by the parent
+ * - When user interacts with area pills or legend filter, we call the onChange callbacks
+ * - This ensures state survives: tab switches, 30s data refresh, and hard F5 reload
+ */
 type LiveMapInnerProps = {
   nfos: NfoStatusRow[];
   sites: SiteRecord[];
+  // Persisted state - controlled by parent
+  mapAreaFilter: string | null;        // "NFOs_ONLY", null (All Sites), or specific area name
+  mapNfoFilter: string | null;         // null (all), "free", "busy", "off-shift"
+  onMapAreaFilterChange: (area: string | null) => void;
+  onMapNfoFilterChange: (filter: string | null) => void;
 };
 
 // Site marker (blue)
@@ -423,19 +437,28 @@ type RouteInfo = {
   durationSeconds: number;
 };
 
-export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
-  // Default to "NFOs_ONLY" for better performance - no site markers loaded initially
-  const [selectedArea, setSelectedArea] = useState<string | null>("NFOs_ONLY");
+export default function LiveMapInner({ 
+  nfos, 
+  sites,
+  mapAreaFilter,
+  mapNfoFilter,
+  onMapAreaFilterChange,
+  onMapNfoFilterChange,
+}: LiveMapInnerProps) {
+  // PERSISTED STATE (controlled by parent, survives tab switch and F5):
+  // - mapAreaFilter: Area/site filter ("NFOs_ONLY", null for All Sites, or specific area)
+  // - mapNfoFilter: NFO status filter (null for all, "free", "busy", "off-shift")
+  // Use the props directly instead of local state, call onChange callbacks on user interaction
+
+  // LOCAL STATE (ephemeral, resets on tab switch - this is intentional):
   const [selectedSiteFromSearch, setSelectedSiteFromSearch] = useState<SiteRecord | null>(null);
-  // Filter NFOs by status (null = show all, "free", "busy", "off-shift")
-  const [selectedNfoFilter, setSelectedNfoFilter] = useState<string | null>(null);
   // Highlight animation state for selected site
   const [showHighlight, setShowHighlight] = useState(false);
   const [highlightRadius, setHighlightRadius] = useState(20);
   // Track which NFO should have its popup opened (from NFO search)
   const [selectedNfoUsername, setSelectedNfoUsername] = useState<string | null>(null);
   
-  // ORS Route state
+  // ORS Route state (ephemeral - route clears on tab switch, which is expected)
   const [activeRoute, setActiveRoute] = useState<RouteInfo | null>(null);
   const [routeLoading, setRouteLoading] = useState<string | null>(null); // username of NFO being loaded
   const [routeError, setRouteError] = useState<string | null>(null);
@@ -488,9 +511,9 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
     const handleSetAreaFilter = (e: any) => {
       const { area } = e.detail;
       if (area === "All") {
-        setSelectedArea(null); // null means "All Sites"
+        onMapAreaFilterChange(null); // null means "All Sites"
       } else if (area) {
-        setSelectedArea(area);
+        onMapAreaFilterChange(area);
       }
     };
 
@@ -498,7 +521,7 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
     return () => {
       window.removeEventListener("setAreaFilter", handleSetAreaFilter);
     };
-  }, []);
+  }, [onMapAreaFilterChange]);
 
   // Filter NFOs and sites with valid coordinates
   const nfosWithCoords = useMemo(() => {
@@ -517,18 +540,18 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
   // Sites filtered by area - used for displaying site markers
   const sitesWithCoords = useMemo(() => {
     // If NFOs_ONLY is selected, return empty array (don't show any sites)
-    if (selectedArea === "NFOs_ONLY") {
+    if (mapAreaFilter === "NFOs_ONLY") {
       return [];
     }
     
     // Apply area filter if a specific area is selected
-    if (selectedArea) {
-      return allSitesWithCoords.filter((site) => site.area === selectedArea);
+    if (mapAreaFilter) {
+      return allSitesWithCoords.filter((site) => site.area === mapAreaFilter);
     }
     
     // Return all sites (All Sites selected)
     return allSitesWithCoords;
-  }, [allSitesWithCoords, selectedArea]);
+  }, [allSitesWithCoords, mapAreaFilter]);
 
   // Build a map of site_id -> SiteRecord for quick lookups (use ALL sites)
   const siteById = useMemo(() => {
@@ -610,18 +633,18 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
     });
   }, [nfosWithCoords, sites]);
 
-  // Filter enrichedNfos based on selected status filter
+  // Filter enrichedNfos based on selected status filter (mapNfoFilter from props)
   const filteredEnrichedNfos = useMemo(() => {
-    if (!selectedNfoFilter) {
+    if (!mapNfoFilter) {
       return enrichedNfos; // Show all
     }
     return enrichedNfos.filter((nfo) => {
-      if (selectedNfoFilter === "free") return nfo.status === "free";
-      if (selectedNfoFilter === "busy") return nfo.status === "busy";
-      if (selectedNfoFilter === "off-shift") return nfo.status !== "free" && nfo.status !== "busy";
+      if (mapNfoFilter === "free") return nfo.status === "free";
+      if (mapNfoFilter === "busy") return nfo.status === "busy";
+      if (mapNfoFilter === "off-shift") return nfo.status !== "free" && nfo.status !== "busy";
       return true;
     });
-  }, [enrichedNfos, selectedNfoFilter]);
+  }, [enrichedNfos, mapNfoFilter]);
 
   // Calculate closest NFOs to the selected site
   // This MUST come after enrichedNfos definition
@@ -790,7 +813,7 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
           <SiteSearch sitesWithCoords={allSitesWithCoords} onSiteSelect={setSelectedSiteFromSearch} />
         </div>
 
-        {/* Filter by (NFOs/Sites) */}
+        {/* Filter by (NFOs/Sites) - persisted via parent */}
         <div style={{ flex: "0 0 auto" }}>
           <h3 style={{ marginTop: 0, marginBottom: "8px", fontSize: "13px", fontWeight: "bold" }}>
             🗺️ Filter by
@@ -799,12 +822,12 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
             sitesWithCoords={sites.filter((site) =>
               hasValidLocation({ lat: site.latitude, lng: site.longitude })
             )}
-            selectedArea={selectedArea}
-            onAreaChange={setSelectedArea}
+            selectedArea={mapAreaFilter}
+            onAreaChange={onMapAreaFilterChange}
           />
         </div>
 
-        {/* Interactive Legend */}
+        {/* Interactive Legend - NFO filter persisted via parent */}
         <div style={{ flex: "0 0 auto" }}>
           <h3 style={{ marginTop: 0, marginBottom: "8px", fontSize: "13px", fontWeight: "bold" }}>
             📋 Legend
@@ -812,8 +835,8 @@ export default function LiveMapInner({ nfos, sites }: LiveMapInnerProps) {
           <MapLegend
             sitesWithCoords={sitesWithCoords}
             nfosWithCoords={nfosWithCoords}
-            selectedNfoFilter={selectedNfoFilter}
-            onFilterChange={setSelectedNfoFilter}
+            selectedNfoFilter={mapNfoFilter}
+            onFilterChange={onMapNfoFilterChange}
           />
         </div>
 

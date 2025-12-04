@@ -3,9 +3,22 @@
 import dynamic from "next/dynamic";
 import type { NfoStatusRow, SiteRecord } from "../lib/nfoHelpers";
 
+/**
+ * Props for LiveMap component.
+ * 
+ * MAP STATE PERSISTENCE:
+ * - `mapAreaFilter` and `mapNfoFilter` are controlled by the parent (page.tsx)
+ * - Parent persists these to localStorage so they survive tab switches and F5
+ * - When user changes filters, LiveMapInner calls the onChange callbacks
+ */
 type LiveMapProps = {
   nfos: NfoStatusRow[];
   sites: SiteRecord[];
+  // Persisted map state - controlled by parent
+  mapAreaFilter: string | null;        // "NFOs_ONLY", null (All Sites), or specific area name
+  mapNfoFilter: string | null;         // null (all), "free", "busy", "off-shift"
+  onMapAreaFilterChange: (area: string | null) => void;
+  onMapNfoFilterChange: (filter: string | null) => void;
 };
 
 const LiveMapInner = dynamic(() => import("./LiveMapInner"), {

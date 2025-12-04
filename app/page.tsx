@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { supabase } from "../lib/supabaseClient";
 import {
   NfoStatusRow,
@@ -18,6 +18,30 @@ import LiveMap from "./components/LiveMap";
 import NfoRoutesView from "./components/NfoRoutesView";
 
 const STUCK_MINUTES = 150; // 2.5 hours
+const REFRESH_INTERVAL_MS = 30_000; // 30 seconds auto-refresh
+
+/**
+ * LocalStorage keys for persistence across hard refresh (F5).
+ * 
+ * PERSISTED STATE:
+ * - Dashboard: selectedTab, statusFilter, areaFilter, searchTerm
+ * - Live Map: mapAreaFilter (NFOs_ONLY / All Sites / specific area), mapNfoFilter (legend filter)
+ * 
+ * This ensures users don't lose their selections when:
+ * 1. Switching between tabs (Dashboard ↔ Live Map)
+ * 2. Data refreshes every 30 seconds
+ * 3. Hard browser refresh (F5)
+ */
+const LS_KEYS = {
+  // Dashboard state
+  selectedTab: "nfoDashboard.selectedTab",
+  statusFilter: "nfoDashboard.statusFilter",
+  areaFilter: "nfoDashboard.areaFilter",
+  searchTerm: "nfoDashboard.searchTerm",
+  // Live Map state
+  mapAreaFilter: "nfoDashboard.mapAreaFilter",   // "NFOs_ONLY", null (All Sites), or area name
+  mapNfoFilter: "nfoDashboard.mapNfoFilter",     // null (all), "free", "busy", "off-shift"
+};
 
 type EnrichedNfo = NfoStatusRow & {
   isOnline: boolean;
@@ -61,143 +85,285 @@ type StatusFilter =
 
 type View = "dashboard" | "map" | "routes" | "settings";
 
+// Helper to safely read from localStorage (client-side only)
+function getStoredValue<T>(key: string, fallback: T): T {
+  if (typeof window === "undefined") return fallback;
+  try {
+    const stored = localStorage.getItem(key);
+    if (stored === null) return fallback;
+    return stored as unknown as T;
+  } catch {
+    return fallback;
+  }
+}
+
+// Helper to safely write to localStorage
+function setStoredValue(key: string, value: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Ignore storage errors (e.g., quota exceeded)
+  }
+}
+
 export default function HomePage() {
+  // ============================================================
+  // UI STATE - Persisted across hard refresh via localStorage
+  // ============================================================
+  
+  // Dashboard state
   const [activeView, setActiveView] = useState<View>("dashboard");
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [areaFilter, setAreaFilter] = useState<string>("all");
+  
+  // Live Map state (persisted so it survives tab switching and F5)
+  // mapAreaFilter: "NFOs_ONLY" (default), null (All Sites), or specific area name
+  const [mapAreaFilter, setMapAreaFilter] = useState<string | null>("NFOs_ONLY");
+  // mapNfoFilter: null (show all NFOs), "free", "busy", or "off-shift"
+  const [mapNfoFilter, setMapNfoFilter] = useState<string | null>(null);
+  
+  // ============================================================
+  // DATA STATE - Refreshed every 30 seconds from Supabase
+  // ============================================================
   const [nfos, setNfos] = useState<NfoStatusRow[]>([]);
   const [sites, setSites] = useState<SiteRecord[]>([]);
   const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [search, setSearch] = useState("");
-  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
-  const [areaFilter, setAreaFilter] = useState<string>("all");
+  
+  // Track last successful refresh time
+  const [lastRefresh, setLastRefresh] = useState<Date | null>(null);
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  
+  // Ref to track if initial load is complete (for showing loading state only on first load)
+  const initialLoadComplete = useRef(false);
 
+  // Restore persisted UI state from localStorage on mount (client-side only)
   useEffect(() => {
-    const loadData = async () => {
-      try {
-        // 1) Load all heartbeat/status rows, newest first
-        const { data, error } = await supabase
-          .from("nfo_status")
-          .select(
-            "username, name, on_shift, status, activity, site_id, lat, lng, logged_in, last_active_at, home_location"
-          )
-          .order("last_active_at", { ascending: false });
+    // Dashboard state
+    const storedTab = getStoredValue(LS_KEYS.selectedTab, "dashboard") as View;
+    const storedStatus = getStoredValue(LS_KEYS.statusFilter, "all") as StatusFilter;
+    const storedArea = getStoredValue(LS_KEYS.areaFilter, "all");
+    const storedSearch = getStoredValue(LS_KEYS.searchTerm, "");
+    
+    setActiveView(storedTab);
+    setStatusFilter(storedStatus);
+    setAreaFilter(storedArea);
+    setSearch(storedSearch);
+    
+    // Live Map state - read as string, then parse
+    const storedMapArea = getStoredValue<string>(LS_KEYS.mapAreaFilter, "NFOs_ONLY");
+    const storedMapNfo = getStoredValue<string>(LS_KEYS.mapNfoFilter, "");
+    
+    // Handle "null" string for "All Sites", otherwise use stored value
+    if (storedMapArea === "null") {
+      setMapAreaFilter(null);
+    } else if (storedMapArea) {
+      setMapAreaFilter(storedMapArea);
+    }
+    
+    // Handle "null" string for "all NFOs", otherwise use stored value
+    if (storedMapNfo === "null" || storedMapNfo === "") {
+      setMapNfoFilter(null);
+    } else {
+      setMapNfoFilter(storedMapNfo);
+    }
+  }, []);
 
-        if (error) throw error;
+  // Persist UI state changes to localStorage
+  const handleSetActiveView = useCallback((view: View) => {
+    setActiveView(view);
+    setStoredValue(LS_KEYS.selectedTab, view);
+  }, []);
 
-        const rows = (data ?? []) as NfoStatusRow[];
+  const handleSetStatusFilter = useCallback((filter: StatusFilter) => {
+    setStatusFilter(filter);
+    setStoredValue(LS_KEYS.statusFilter, filter);
+  }, []);
 
-        // 1b) Load Site_Coordinates - fetch ALL sites using pagination
-        // Supabase default limit is 1000 rows, so we need to paginate to get all ~3516 sites
-        let allSiteRows: any[] = [];
-        let pageNumber = 0;
-        const PAGE_SIZE = 1000;
-        let hasMoreRows = true;
+  const handleSetAreaFilter = useCallback((area: string) => {
+    setAreaFilter(area);
+    setStoredValue(LS_KEYS.areaFilter, area);
+  }, []);
 
-        while (hasMoreRows) {
-          const start = pageNumber * PAGE_SIZE;
-          const end = start + PAGE_SIZE - 1;
-          
-          const { data: siteRowsPage, error: siteError } = await supabase
-            .from("Site_Coordinates")
-            .select("site_id, site_name, latitude, longitude, area")
-            .range(start, end);
+  const handleSetSearch = useCallback((term: string) => {
+    setSearch(term);
+    setStoredValue(LS_KEYS.searchTerm, term);
+  }, []);
 
-          if (siteError) throw siteError;
+  // Live Map state handlers - persist to localStorage
+  const handleSetMapAreaFilter = useCallback((area: string | null) => {
+    setMapAreaFilter(area);
+    // Store null as string "null" so we can distinguish from empty
+    setStoredValue(LS_KEYS.mapAreaFilter, area === null ? "null" : area);
+  }, []);
 
-          if (!siteRowsPage || siteRowsPage.length === 0) {
-            hasMoreRows = false;
-            break;
-          }
+  const handleSetMapNfoFilter = useCallback((filter: string | null) => {
+    setMapNfoFilter(filter);
+    setStoredValue(LS_KEYS.mapNfoFilter, filter === null ? "null" : filter);
+  }, []);
 
-          allSiteRows = allSiteRows.concat(siteRowsPage);
-          
-          // If we got less than PAGE_SIZE rows, we've reached the end
-          if (siteRowsPage.length < PAGE_SIZE) {
-            hasMoreRows = false;
-          }
+  // Main data fetching function - called on mount and every 30 seconds
+  const fetchDashboardData = useCallback(async (isInitialLoad: boolean = false) => {
+    try {
+      // Only show loading spinner on initial load, not on refresh
+      if (isInitialLoad) {
+        setLoading(true);
+      }
+      setRefreshError(null);
 
-          pageNumber++;
+      // 1) Load all heartbeat/status rows, newest first
+      const { data, error: nfoError } = await supabase
+        .from("nfo_status")
+        .select(
+          "username, name, on_shift, status, activity, site_id, lat, lng, logged_in, last_active_at, home_location"
+        )
+        .order("last_active_at", { ascending: false });
+
+      if (nfoError) throw nfoError;
+
+      const rows = (data ?? []) as NfoStatusRow[];
+
+      // 1b) Load Site_Coordinates - fetch ALL sites using pagination
+      let allSiteRows: any[] = [];
+      let pageNumber = 0;
+      const PAGE_SIZE = 1000;
+      let hasMoreRows = true;
+
+      while (hasMoreRows) {
+        const start = pageNumber * PAGE_SIZE;
+        const end = start + PAGE_SIZE - 1;
+        
+        const { data: siteRowsPage, error: siteError } = await supabase
+          .from("Site_Coordinates")
+          .select("site_id, site_name, latitude, longitude, area")
+          .range(start, end);
+
+        if (siteError) throw siteError;
+
+        if (!siteRowsPage || siteRowsPage.length === 0) {
+          hasMoreRows = false;
+          break;
         }
 
+        allSiteRows = allSiteRows.concat(siteRowsPage);
+        
+        if (siteRowsPage.length < PAGE_SIZE) {
+          hasMoreRows = false;
+        }
+
+        pageNumber++;
+      }
+
+      if (isInitialLoad) {
         console.log("Site rows from Supabase:", allSiteRows.length, "rows (fetched across", pageNumber, "pages)");
-        if (allSiteRows && allSiteRows.length > 0) {
-          console.log("First site row:", allSiteRows[0]);
+      }
+
+      const siteRecords: SiteRecord[] =
+        (allSiteRows ?? []).map((row: any) => {
+          const lat = typeof row.latitude === "string" ? parseFloat(row.latitude) : row.latitude;
+          const lng = typeof row.longitude === "string" ? parseFloat(row.longitude) : row.longitude;
+          return {
+            site_id: row.site_id,
+            name: row.site_name ?? null,
+            latitude: Number.isFinite(lat) ? lat : null,
+            longitude: Number.isFinite(lng) ? lng : null,
+            area: row.area ?? null,
+          };
+        }) ?? [];
+      
+      setSites(siteRecords);
+
+      // 2) Keep only latest row per username
+      const latestByUser = new Map<string, NfoStatusRow>();
+      for (const row of rows) {
+        if (!row.username) continue;
+        if (!latestByUser.has(row.username)) {
+          latestByUser.set(row.username, row);
+        }
+      }
+
+      const current = Array.from(latestByUser.values());
+
+      // 3) Compute stats
+      let totalNFOs = current.length;
+      let online = 0;
+      let offline = 0;
+      let free = 0;
+      let busy = 0;
+      let onShift = 0;
+      let offShift = 0;
+
+      for (const row of current) {
+        const loggedIn = !!row.logged_in;
+        const onShiftVal = !!row.on_shift;
+
+        if (loggedIn && onShiftVal) {
+          online += 1;
+        } else {
+          offline += 1;
         }
 
-        const siteRecords: SiteRecord[] =
-          (allSiteRows ?? []).map((row: any) => {
-            // Parse latitude and longitude from strings to numbers
-            const lat = typeof row.latitude === "string" ? parseFloat(row.latitude) : row.latitude;
-            const lng = typeof row.longitude === "string" ? parseFloat(row.longitude) : row.longitude;
-            return {
-              site_id: row.site_id,
-              name: row.site_name ?? null,
-              latitude: Number.isFinite(lat) ? lat : null,
-              longitude: Number.isFinite(lng) ? lng : null,
-              area: row.area ?? null,
-            };
-          }) ?? [];
-        
-        console.log("Parsed site records:", siteRecords.length, "records");
-        if (siteRecords.length > 0) {
-          console.log("First parsed site:", siteRecords[0]);
-        }
-        
-        setSites(siteRecords);
-
-        // 2) Keep only latest row per username
-        const latestByUser = new Map<string, NfoStatusRow>();
-        for (const row of rows) {
-          if (!row.username) continue;
-          if (!latestByUser.has(row.username)) {
-            latestByUser.set(row.username, row);
-          }
+        if (onShiftVal) {
+          onShift += 1;
+        } else {
+          offShift += 1;
         }
 
-        const current = Array.from(latestByUser.values());
+        const s = (row.status ?? "").toLowerCase();
+        if (s === "busy") busy += 1;
+        if (s === "free") free += 1;
+      }
 
-        // 3) Compute stats
-        let totalNFOs = current.length;
-        let online = 0;
-        let offline = 0;
-        let free = 0;
-        let busy = 0;
-        let onShift = 0;
-        let offShift = 0;
-
-        for (const row of current) {
-          const loggedIn = !!row.logged_in;
-          const onShiftVal = !!row.on_shift;
-
-          if (loggedIn && onShiftVal) {
-            online += 1;
-          } else {
-            offline += 1;
-          }
-
-          if (onShiftVal) {
-            onShift += 1;
-          } else {
-            offShift += 1;
-          }
-
-          const s = (row.status ?? "").toLowerCase();
-          if (s === "busy") busy += 1;
-          if (s === "free") free += 1;
-        }
-
-        setNfos(current);
-        setStats({ totalNFOs, online, offline, free, busy, onShift, offShift });
-      } catch (err: any) {
-        setError(err.message ?? "Error loading data");
-      } finally {
+      setNfos(current);
+      setStats({ totalNFOs, online, offline, free, busy, onShift, offShift });
+      setLastRefresh(new Date());
+      setError(null);
+      initialLoadComplete.current = true;
+    } catch (err: any) {
+      // Extract error message safely
+      const errorMsg = err instanceof Error ? err.message : String(err ?? "Unknown error");
+      
+      /*
+       * ERROR HANDLING STRATEGY:
+       * - Initial load: Show full error screen (user needs to know something is wrong)
+       * - Subsequent refreshes: Keep existing data visible, show small warning
+       * - Use console.warn instead of console.error to avoid Next.js red overlay
+       */
+      if (isInitialLoad || !initialLoadComplete.current) {
+        // Initial load failed - show error screen
+        setError(errorMsg);
+        console.warn("[Dashboard] Initial load failed:", errorMsg);
+      } else {
+        // Refresh failed - KEEP existing data, just show warning
+        // Do NOT clear nfos, sites, stats - they stay as-is from last successful fetch
+        setRefreshError(errorMsg);
+        console.warn("[Dashboard] Auto-refresh failed (keeping last good data):", errorMsg);
+      }
+    } finally {
+      if (isInitialLoad) {
         setLoading(false);
       }
-    };
-
-    loadData();
+    }
   }, []);
+
+  // Initial load and auto-refresh interval
+  useEffect(() => {
+    // Initial fetch
+    fetchDashboardData(true);
+
+    // Set up 30-second polling interval
+    const intervalId = setInterval(() => {
+      fetchDashboardData(false);
+    }, REFRESH_INTERVAL_MS);
+
+    // Cleanup on unmount
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [fetchDashboardData]);
 
   const areas = useMemo(
     () =>
@@ -469,7 +635,7 @@ export default function HomePage() {
             <button
               key={item.id}
               type="button"
-              onClick={() => setActiveView(item.id as View)}
+              onClick={() => handleSetActiveView(item.id as View)}
               className={[
                 "w-full text-left px-3 py-2 rounded-md transition",
                 activeView === item.id
@@ -482,21 +648,54 @@ export default function HomePage() {
           ))}
         </nav>
         <div className="px-4 py-3 border-t border-slate-800 text-xs text-slate-500">
-          Data source: Supabase · nfo_status
+          <div>Data source: Supabase · nfo_status</div>
+          {lastRefresh && (
+            <div className={`mt-1 ${refreshError ? "text-orange-400" : "text-slate-400"}`}>
+              Last refresh: {lastRefresh.toLocaleTimeString()}
+              {refreshError && " ⚠️"}
+            </div>
+          )}
+          <div className="mt-1 text-slate-400">
+            Auto-refresh: every 30s
+          </div>
         </div>
       </aside>
 
       {/* Main content */}
       <main className="flex-1 px-4 py-8 overflow-auto">
+        {/* Global refresh error banner - shows on all tabs when auto-refresh fails */}
+        {refreshError && (
+          <div className="max-w-6xl mx-auto mb-4">
+            <div className="bg-orange-50 border border-orange-200 rounded-lg px-4 py-2 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="text-orange-500">⚠️</span>
+                <span className="text-sm text-orange-700">
+                  Auto-refresh failed: {refreshError}. Showing last successful data.
+                </span>
+              </div>
+              <span className="text-xs text-orange-500">
+                Retrying in {Math.round(REFRESH_INTERVAL_MS / 1000)}s...
+              </span>
+            </div>
+          </div>
+        )}
+
         {activeView === "dashboard" && (
           <div className="max-w-5xl mx-auto space-y-6">
             <header className="flex items-center justify-between">
               <h1 className="text-2xl font-bold">
                 NFO Manager Dashboard (Web v0)
               </h1>
-              <span className="text-xs text-gray-500">
-                Data source: Supabase · table nfo_status
-              </span>
+              <div className="text-right">
+                <span className="text-xs text-gray-500 block">
+                  Data source: Supabase · table nfo_status
+                </span>
+                {refreshError && (
+                  <span className="text-xs text-orange-600 block">
+                    ⚠️ Refresh failed: {refreshError}
+                  </span>
+                )}
+              </div>
             </header>
 
             {/* KPI cards */}
@@ -628,14 +827,14 @@ export default function HomePage() {
                 <input
                   type="text"
                   value={search}
-                  onChange={(e) => setSearch(e.target.value)}
+                  onChange={(e) => handleSetSearch(e.target.value)}
                   placeholder="Search by username or name"
                   className="border rounded-md px-3 py-1 text-sm"
                 />
                 <select
                   value={statusFilter}
                   onChange={(e) =>
-                    setStatusFilter(e.target.value as StatusFilter)
+                    handleSetStatusFilter(e.target.value as StatusFilter)
                   }
                   className="border rounded-md px-2 py-1 text-sm"
                 >
@@ -650,7 +849,7 @@ export default function HomePage() {
                 </select>
                 <select
                   value={areaFilter}
-                  onChange={(e) => setAreaFilter(e.target.value)}
+                  onChange={(e) => handleSetAreaFilter(e.target.value)}
                   className="border rounded-md px-2 py-1 text-sm"
                 >
                   <option value="all">All areas</option>
@@ -729,17 +928,37 @@ export default function HomePage() {
           </div>
         )}
 
-        {activeView === "map" && (
-          <div className="max-w-6xl mx-auto space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xl font-semibold">Live map</h2>
-              <p className="text-xs text-slate-500">
-                Showing NFO positions from the latest heartbeat (nfo_status).
-              </p>
-            </div>
-            <LiveMap nfos={nfos} sites={sites} />
+        {/* 
+          IMPORTANT: LiveMap uses display:none instead of conditional rendering
+          This keeps the component MOUNTED when switching tabs, preserving:
+          - Selected site from search
+          - Selected NFO 
+          - Active route
+          - Map zoom/center position
+          
+          The filters (mapAreaFilter, mapNfoFilter) are also persisted to localStorage
+          so they survive F5 refresh as well.
+        */}
+        <div 
+          className="max-w-6xl mx-auto space-y-4"
+          style={{ display: activeView === "map" ? "block" : "none" }}
+        >
+          <div className="flex items-center justify-between">
+            <h2 className="text-xl font-semibold">Live map</h2>
+            <p className="text-xs text-slate-500">
+              Showing NFO positions from the latest heartbeat (nfo_status).
+            </p>
           </div>
-        )}
+          {/* LiveMap stays mounted - internal state survives tab switches */}
+          <LiveMap 
+            nfos={nfos} 
+            sites={sites}
+            mapAreaFilter={mapAreaFilter}
+            mapNfoFilter={mapNfoFilter}
+            onMapAreaFilterChange={handleSetMapAreaFilter}
+            onMapNfoFilterChange={handleSetMapNfoFilter}
+          />
+        </div>
 
         {activeView === "routes" && (
           <div className="max-w-6xl mx-auto space-y-4">
