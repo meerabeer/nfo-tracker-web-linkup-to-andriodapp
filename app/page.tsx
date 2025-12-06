@@ -50,6 +50,7 @@ type EnrichedNfo = NfoStatusRow & {
   nearestSiteId: string | null;
   nearestSiteName: string | null;
   nearestSiteDistanceKm: number | null;
+  distanceToAssignedSiteKm: number | null; // Distance to site_id (assigned site)
   distanceLabel: string;
   siteLabel: string;
   isNotActive: boolean;
@@ -59,24 +60,26 @@ type EnrichedNfo = NfoStatusRow & {
   isFree: boolean;
   isOnShift: boolean;
   isOffShift: boolean;
+  isDeviceSilent: boolean; // status field from Kotlin app is "device-silent"
 };
 
 type Stats = {
   totalNFOs: number;
-  online: number;
-  offline: number;
-  free: number;
-  busy: number;
   onShift: number;
+  busy: number;
+  free: number;
   offShift: number;
+  notActive: number;
 };
 
 type AreaSummary = {
   area: string;
   total: number;
-  online: number;
   onShift: number;
   busy: number;
+  free: number;
+  offShift: number;
+  notActive: number;
 };
 
 type StatusFilter =
@@ -85,9 +88,10 @@ type StatusFilter =
   | "offshift"
   | "busy"
   | "free"
-  | "online"
-  | "offline"
+  | "devicesilent"
   | "notactive";
+
+type KpiCategory = "total" | "onShift" | "busy" | "free" | "offShift" | "notActive";
 
 type View = "dashboard" | "map" | "routes" | "settings";
 
@@ -130,12 +134,14 @@ export default function HomePage() {
   // mapNfoFilter: null (show all NFOs), "free", "busy", "on-shift", or "off-shift"
   const [mapNfoFilter, setMapNfoFilter] = useState<string | null>(null);
   
+  // Active KPI category for the NFO list panel
+  const [activeKpi, setActiveKpi] = useState<KpiCategory | null>("total");
+  
   // ============================================================
   // DATA STATE - Refreshed every 30 seconds from Supabase
   // ============================================================
   const [nfos, setNfos] = useState<NfoStatusRow[]>([]);
   const [sites, setSites] = useState<SiteRecord[]>([]);
-  const [stats, setStats] = useState<Stats | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   
@@ -293,39 +299,11 @@ export default function HomePage() {
 
       const current = Array.from(latestByUser.values());
 
-      // 3) Compute stats
-      let totalNFOs = current.length;
-      let online = 0;
-      let offline = 0;
-      let free = 0;
-      let busy = 0;
-      let onShift = 0;
-      let offShift = 0;
-
-      for (const row of current) {
-        const loggedIn = !!row.logged_in;
-        const onShiftVal = !!row.on_shift;
-
-        if (loggedIn && onShiftVal) {
-          online += 1;
-        } else {
-          offline += 1;
-        }
-
-        if (onShiftVal) {
-          onShift += 1;
-        } else {
-          offShift += 1;
-        }
-
-        // Use new assignment-based logic for Busy/Free
-        const { isBusy, isFree } = computeAssignmentState(row);
-        if (isBusy) busy += 1;
-        if (isFree) free += 1;
-      }
+      // 3) Compute stats - these are basic counts from raw data
+      //    Full stats with enriched flags will be computed after enrichedNfos
+      const totalNFOs = current.length;
 
       setNfos(current);
-      setStats({ totalNFOs, online, offline, free, busy, onShift, offShift });
       setLastRefresh(new Date());
       setError(null);
       initialLoadComplete.current = true;
@@ -384,48 +362,6 @@ export default function HomePage() {
     [nfos]
   );
 
-  const areaSummary = useMemo(() => {
-    const summaryMap = new Map<string, AreaSummary>();
-
-    for (const area of areas) {
-      summaryMap.set(area, {
-        area,
-        total: 0,
-        online: 0,
-        onShift: 0,
-        busy: 0,
-      });
-    }
-
-    for (const row of nfos) {
-      const area = row.home_location?.trim();
-      if (!area) continue;
-
-      const summary = summaryMap.get(area);
-      if (!summary) continue;
-
-      summary.total += 1;
-
-      const loggedIn = !!row.logged_in;
-      const onShiftVal = !!row.on_shift;
-      if (loggedIn && onShiftVal) {
-        summary.online += 1;
-      }
-
-      if (onShiftVal) {
-        summary.onShift += 1;
-      }
-
-      // Use new assignment-based logic for Busy count
-      const { isBusy } = computeAssignmentState(row);
-      if (isBusy) {
-        summary.busy += 1;
-      }
-    }
-
-    return Array.from(summaryMap.values());
-  }, [nfos, areas]);
-
   const filteredNfos = useMemo(
     () =>
       nfos.filter((row) => {
@@ -448,18 +384,18 @@ export default function HomePage() {
           case "free":
             matchesStatus = isFree;
             break;
-          case "online":
-            matchesStatus = loggedIn;
-            break;
-          case "offline":
-            matchesStatus = !loggedIn;
-            break;
           case "onshift":
             matchesStatus = onShift;
             break;
           case "offshift":
             matchesStatus = !onShift;
             break;
+          case "devicesilent": {
+            // Check if NFO status is device-silent (from Kotlin app)
+            const statusLower = (row.status ?? "").toLowerCase().trim();
+            matchesStatus = statusLower === "device-silent";
+            break;
+          }
           case "notactive": {
             // Check if NFO is not active (no ping > 30 min)
             const { isNotActive } = computePingStatus(row.last_active_at);
@@ -526,73 +462,63 @@ export default function HomePage() {
       let nearestSiteId: string | null = null;
       let nearestSiteName: string | null = null;
       let nearestSiteDistanceKm: number | null = null;
+      let distanceToAssignedSiteKm: number | null = null;
       let distanceLabel = "N/A";
       let siteLabel = "N/A";
 
       // Use new assignment-based busy/free and shift logic
       const { isBusy, isFree, isOnShift, isOffShift } = computeAssignmentState(nfo);
 
-      // If NFO is busy and has an assigned site with valid coords, use that
+      // Compute distance to assigned site (site_id) if available
+      const assignedSiteId = (nfo.site_id ?? "").trim();
       if (
-        isBusy &&
-        nfo.site_id &&
+        assignedSiteId &&
         hasValidLocation({ lat: nfo.lat, lng: nfo.lng })
       ) {
-        const activeSite = getSiteById(sites, nfo.site_id);
+        const assignedSite = getSiteById(sites, assignedSiteId);
         if (
-          activeSite &&
-          hasValidLocation({ lat: activeSite.latitude, lng: activeSite.longitude })
+          assignedSite &&
+          hasValidLocation({ lat: assignedSite.latitude, lng: assignedSite.longitude })
         ) {
-          const dist = calculateDistanceKm(
+          distanceToAssignedSiteKm = calculateDistanceKm(
             { lat: nfo.lat, lng: nfo.lng },
-            { lat: activeSite.latitude, lng: activeSite.longitude }
+            { lat: assignedSite.latitude, lng: assignedSite.longitude }
           );
-          nearestSiteId = activeSite.site_id;
-          nearestSiteName = activeSite.name ?? null;
-          nearestSiteDistanceKm = dist;
-          distanceLabel = formatDistanceLabel(dist);
-          siteLabel = `Busy at site ${nearestSiteId} - ${distanceLabel}`;
-        } else {
-          siteLabel = `Busy at site ${nfo.site_id} - N/A (missing coordinates)`;
-        }
-      } else {
-        // Otherwise, find nearest site
-        const nearest = findNearestSite(
-          { lat: nfo.lat, lng: nfo.lng },
-          sites
-        );
-
-        if (nearest) {
-          const siteRec = nearest.site as SiteRecord;
-          nearestSiteId = siteRec.site_id;
-          nearestSiteName = siteRec.name ?? null;
-          nearestSiteDistanceKm = nearest.distanceKm;
-          distanceLabel = formatDistanceLabel(nearest.distanceKm);
-
-          if (isFree && nfo.on_shift) {
-            siteLabel = `Free near site ${nearestSiteId} - ${distanceLabel}`;
-          } else {
-            siteLabel = `Nearest site ${nearestSiteId} - ${distanceLabel}`;
-          }
-        } else if (!hasValidLocation({ lat: nfo.lat, lng: nfo.lng })) {
-          siteLabel = "No GPS";
         }
       }
 
-      if (nfo.username === "ZAMEBIR") {
-        console.log("[Dashboard DISTANCE DEBUG]", {
-          username: nfo.username,
-          status: nfo.status,
-          site_id: nfo.site_id,
-          nfoLat: nfo.lat,
-          nfoLng: nfo.lng,
-          nearestSiteId: nearestSiteId ?? null,
-          nearestSiteDistanceKm,
-        });
+      // Always find the nearest site (for the "Nearest site" column)
+      const nearest = findNearestSite(
+        { lat: nfo.lat, lng: nfo.lng },
+        sites
+      );
+
+      if (nearest) {
+        const siteRec = nearest.site as SiteRecord;
+        nearestSiteId = siteRec.site_id;
+        nearestSiteName = siteRec.name ?? null;
+        nearestSiteDistanceKm = nearest.distanceKm;
+        distanceLabel = formatDistanceLabel(nearest.distanceKm);
+
+        if (isBusy && assignedSiteId) {
+          siteLabel = `Busy at site ${assignedSiteId} - ${distanceToAssignedSiteKm !== null ? formatDistanceLabel(distanceToAssignedSiteKm) : "N/A"}`;
+        } else if (isFree && nfo.on_shift) {
+          siteLabel = `Free near site ${nearestSiteId} - ${distanceLabel}`;
+        } else {
+          siteLabel = `Nearest site ${nearestSiteId} - ${distanceLabel}`;
+        }
+      } else if (!hasValidLocation({ lat: nfo.lat, lng: nfo.lng })) {
+        siteLabel = "No GPS";
+      } else if (isBusy && assignedSiteId) {
+        siteLabel = `Busy at site ${assignedSiteId} - N/A (missing coordinates)`;
       }
 
       // Compute ping status (not active if no ping > 30 min)
       const { isNotActive, pingReason } = computePingStatus(nfo.last_active_at);
+
+      // Compute device-silent flag (status from Kotlin app)
+      const statusLower = (nfo.status ?? "").toLowerCase().trim();
+      const isDeviceSilent = statusLower === "device-silent";
 
       return {
         ...nfo,
@@ -601,6 +527,7 @@ export default function HomePage() {
         nearestSiteId,
         nearestSiteName,
         nearestSiteDistanceKm,
+        distanceToAssignedSiteKm,
         distanceLabel,
         siteLabel,
         isNotActive,
@@ -610,9 +537,89 @@ export default function HomePage() {
         isFree,
         isOnShift,
         isOffShift,
+        isDeviceSilent,
       };
     });
   }, [nfos, sites]);
+
+  // Compute stats from enrichedNfos using the computed flags
+  const stats = useMemo((): Stats => {
+    return {
+      totalNFOs: enrichedNfos.length,
+      onShift: enrichedNfos.filter(n => n.isOnShift).length,
+      busy: enrichedNfos.filter(n => n.isBusy).length,
+      free: enrichedNfos.filter(n => n.isFree).length,
+      offShift: enrichedNfos.filter(n => n.isOffShift).length,
+      notActive: enrichedNfos.filter(n => n.isNotActive).length,
+    };
+  }, [enrichedNfos]);
+
+  // Compute area summary from enrichedNfos
+  const areaSummary = useMemo(() => {
+    const summaryMap = new Map<string, AreaSummary>();
+
+    for (const area of areas) {
+      summaryMap.set(area, {
+        area,
+        total: 0,
+        onShift: 0,
+        busy: 0,
+        free: 0,
+        offShift: 0,
+        notActive: 0,
+      });
+    }
+
+    // Use enrichedNfos to get the computed flags
+    for (const nfo of enrichedNfos) {
+      const area = nfo.home_location?.trim();
+      if (!area) continue;
+
+      const summary = summaryMap.get(area);
+      if (!summary) continue;
+
+      summary.total += 1;
+      if (nfo.isOnShift) summary.onShift += 1;
+      if (nfo.isBusy) summary.busy += 1;
+      if (nfo.isFree) summary.free += 1;
+      if (nfo.isOffShift) summary.offShift += 1;
+      if (nfo.isNotActive) summary.notActive += 1;
+    }
+
+    return Array.from(summaryMap.values());
+  }, [enrichedNfos, areas]);
+
+  // Generate NFO lists for KPI panel (replaces old tooltip strings)
+  const kpiLists = useMemo((): Record<KpiCategory, { label: string; items: string[] }> => {
+    const formatName = (n: EnrichedNfo) => n.name ? `${n.username} – ${n.name}` : n.username;
+
+    return {
+      total: {
+        label: "Total NFOs",
+        items: enrichedNfos.map(formatName),
+      },
+      onShift: {
+        label: "On-shift NFOs",
+        items: enrichedNfos.filter(n => n.isOnShift).map(formatName),
+      },
+      busy: {
+        label: "Busy NFOs",
+        items: enrichedNfos.filter(n => n.isBusy).map(formatName),
+      },
+      free: {
+        label: "Free NFOs",
+        items: enrichedNfos.filter(n => n.isFree).map(formatName),
+      },
+      offShift: {
+        label: "Off-shift NFOs",
+        items: enrichedNfos.filter(n => n.isOffShift).map(formatName),
+      },
+      notActive: {
+        label: "Not Active (>30m) NFOs",
+        items: enrichedNfos.filter(n => n.isNotActive).map(formatName),
+      },
+    };
+  }, [enrichedNfos]);
 
   if (loading) {
     return (
@@ -714,49 +721,76 @@ export default function HomePage() {
               </div>
             </header>
 
-            {/* KPI cards */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {/* KPI cards - Order: Total, On shift, Busy, Free, Off shift, Not Active */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
               <StatCard
                 label="Total NFOs"
-                value={stats?.totalNFOs ?? 0}
+                value={stats.totalNFOs}
                 accent="bg-sky-500"
-              />
-              <StatCard
-                label="Online"
-                value={stats?.online ?? 0}
-                accent="bg-green-500"
-              />
-              <StatCard
-                label="Offline"
-                value={stats?.offline ?? 0}
-                accent="bg-red-500"
+                isActive={activeKpi === "total"}
+                onMouseEnter={() => setActiveKpi("total")}
               />
               <StatCard
                 label="On shift"
-                value={stats?.onShift ?? 0}
+                value={stats.onShift}
                 accent="bg-emerald-500"
-              />
-              <StatCard
-                label="Off shift"
-                value={stats?.offShift ?? 0}
-                accent="bg-gray-400"
-              />
-              <StatCard
-                label="Free"
-                value={stats?.free ?? 0}
-                accent="bg-orange-400"
+                isActive={activeKpi === "onShift"}
+                onMouseEnter={() => setActiveKpi("onShift")}
               />
               <StatCard
                 label="Busy"
-                value={stats?.busy ?? 0}
-                accent="bg-blue-400"
+                value={stats.busy}
+                accent="bg-red-500"
+                isActive={activeKpi === "busy"}
+                onMouseEnter={() => setActiveKpi("busy")}
+              />
+              <StatCard
+                label="Free"
+                value={stats.free}
+                accent="bg-green-500"
+                isActive={activeKpi === "free"}
+                onMouseEnter={() => setActiveKpi("free")}
+              />
+              <StatCard
+                label="Off shift"
+                value={stats.offShift}
+                accent="bg-gray-400"
+                isActive={activeKpi === "offShift"}
+                onMouseEnter={() => setActiveKpi("offShift")}
               />
               <StatCard
                 label="Not Active (>30m)"
-                value={enrichedNfos.filter((n) => n.isNotActive).length}
+                value={stats.notActive}
                 accent="bg-yellow-500"
+                isActive={activeKpi === "notActive"}
+                onMouseEnter={() => setActiveKpi("notActive")}
               />
             </div>
+
+            {/* NFO List Panel - shows NFOs for the active KPI category */}
+            {activeKpi && (
+              <div className="rounded-xl border border-slate-200 bg-white p-4 max-h-48 overflow-y-auto shadow-sm">
+                <div className="flex items-baseline justify-between mb-2">
+                  <h3 className="font-semibold text-sm text-slate-700">
+                    {kpiLists[activeKpi].label}
+                  </h3>
+                  <span className="text-xs text-slate-500">
+                    {kpiLists[activeKpi].items.length} NFOs
+                  </span>
+                </div>
+                {kpiLists[activeKpi].items.length === 0 ? (
+                  <div className="text-xs text-slate-400">No NFOs in this category.</div>
+                ) : (
+                  <ul className="text-xs text-slate-700 space-y-1">
+                    {kpiLists[activeKpi].items.map((item, idx) => (
+                      <li key={idx} className="truncate">
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
 
             {/* Stuck at site > 2.5 hours panel */}
             {stuckNfos.length > 0 && (
@@ -813,9 +847,11 @@ export default function HomePage() {
                       <tr className="bg-slate-50 border-b">
                         <th className="text-left px-3 py-2 font-semibold">Area</th>
                         <th className="text-center px-3 py-2 font-semibold">Total</th>
-                        <th className="text-center px-3 py-2 font-semibold">Online</th>
                         <th className="text-center px-3 py-2 font-semibold">On shift</th>
                         <th className="text-center px-3 py-2 font-semibold">Busy</th>
+                        <th className="text-center px-3 py-2 font-semibold">Free</th>
+                        <th className="text-center px-3 py-2 font-semibold">Off shift</th>
+                        <th className="text-center px-3 py-2 font-semibold">Not Active</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -823,9 +859,11 @@ export default function HomePage() {
                         <tr key={summary.area} className="border-b hover:bg-slate-50">
                           <td className="text-left px-3 py-2">{summary.area}</td>
                           <td className="text-center px-3 py-2">{summary.total}</td>
-                          <td className="text-center px-3 py-2">{summary.online}</td>
                           <td className="text-center px-3 py-2">{summary.onShift}</td>
                           <td className="text-center px-3 py-2">{summary.busy}</td>
+                          <td className="text-center px-3 py-2">{summary.free}</td>
+                          <td className="text-center px-3 py-2">{summary.offShift}</td>
+                          <td className="text-center px-3 py-2">{summary.notActive}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -859,8 +897,7 @@ export default function HomePage() {
                   <option value="offshift">Off shift</option>
                   <option value="busy">Busy</option>
                   <option value="free">Free</option>
-                  <option value="online">Online</option>
-                  <option value="offline">Offline</option>
+                  <option value="devicesilent">Device-silent</option>
                   <option value="notactive">Not Active (&gt;30m)</option>
                 </select>
                 <select
@@ -925,8 +962,9 @@ export default function HomePage() {
                             {enriched.nearestSiteId ?? "-"}
                           </td>
                           <td className="py-2 px-2 text-xs">
-                            {enriched.nearestSiteDistanceKm !== null
-                              ? enriched.nearestSiteDistanceKm.toFixed(2)
+                            {/* Show distance to assigned site_id if available, otherwise fall back to nearest site */}
+                            {(enriched.distanceToAssignedSiteKm ?? enriched.nearestSiteDistanceKm) !== null
+                              ? (enriched.distanceToAssignedSiteKm ?? enriched.nearestSiteDistanceKm)!.toFixed(2)
                               : "-"}
                           </td>
                           <td className="py-2 px-2 text-xs text-gray-500">
@@ -1004,11 +1042,18 @@ type StatCardProps = {
   label: string;
   value: number;
   accent: string; // Tailwind class
+  isActive?: boolean; // Whether this card is currently selected
+  onMouseEnter?: () => void; // Handler for hover
 };
 
-function StatCard({ label, value, accent }: StatCardProps) {
+function StatCard({ label, value, accent, isActive, onMouseEnter }: StatCardProps) {
   return (
-    <div className="bg-white rounded-xl shadow p-4 flex flex-col gap-1">
+    <div 
+      className={`bg-white rounded-xl shadow p-4 flex flex-col gap-1 cursor-pointer transition-all ${
+        isActive ? "ring-2 ring-sky-500 ring-offset-1" : "hover:bg-slate-50"
+      }`}
+      onMouseEnter={onMouseEnter}
+    >
       <span className="text-xs text-gray-500">{label}</span>
       <div className="flex items-end justify-between mt-1">
         <span className="text-2xl font-bold">{value}</span>
