@@ -144,6 +144,10 @@ export default function RoutePlanner({ nfos, sites, warehouses, state, onStateCh
   const [routeLoading, setRouteLoading] = useState(false);
   const [routeError, setRouteError] = useState<string | null>(null);
   const [routeWarning, setRouteWarning] = useState<string | null>(null);
+  
+  // Token to trigger fit-to-bounds only once per new route
+  // Incremented when user clicks Route, so the map fits once then respects manual zoom
+  const [routeFitToken, setRouteFitToken] = useState(0);
 
   // Destructure state for easier access
   const {
@@ -450,6 +454,10 @@ export default function RoutePlanner({ nfos, sites, warehouses, state, onStateCh
 
       // Set the final result
       setRouteWarning(warning);
+      
+      // Increment fit token to trigger one-time fit-to-bounds for this new route
+      setRouteFitToken((t) => t + 1);
+      
       updateState({
         routeResult: {
           coordinates: finalCoords,
@@ -483,6 +491,8 @@ export default function RoutePlanner({ nfos, sites, warehouses, state, onStateCh
     });
     setRouteError(null);
     setRouteWarning(null);
+    // Increment fit token so next Route click will fit to bounds
+    setRouteFitToken((t) => t + 1);
   }, [updateState]);
 
   // Format duration
@@ -745,6 +755,7 @@ export default function RoutePlanner({ nfos, sites, warehouses, state, onStateCh
         <RoutePlannerMap
           points={routePoints}
           routeCoordinates={routeResult?.coordinates ?? null}
+          routeFitToken={routeFitToken}
         />
       </div>
     </div>

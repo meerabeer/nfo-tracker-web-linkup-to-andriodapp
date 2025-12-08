@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useEffect } from "react";
+import { useMemo, useEffect, useRef } from "react";
 import { MapContainer, TileLayer, Marker, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
@@ -46,12 +46,25 @@ const nfoIcon = createIcon("#3B82F6", "N"); // Blue for NFO
 const warehouseIcon = createIcon("#8B5CF6", "W"); // Purple for Warehouse  
 const siteIcon = createIcon("#F97316", "S"); // Orange for Site
 
-// Component to fit bounds when points change
-function FitBounds({ points }: { points: RoutePoint[] }) {
+// Component to fit bounds ONCE per new route (controlled by routeFitToken)
+// After initial fit, user's manual zoom/pan is respected until next Route click
+function FitBounds({ points, routeFitToken }: { points: RoutePoint[]; routeFitToken: number }) {
   const map = useMap();
+  const hasFitToRouteRef = useRef(false);
+  const lastFitTokenRef = useRef<number | null>(null);
 
+  // Reset the fit flag when routeFitToken changes (new route requested)
+  useEffect(() => {
+    if (lastFitTokenRef.current !== routeFitToken) {
+      hasFitToRouteRef.current = false;
+      lastFitTokenRef.current = routeFitToken;
+    }
+  }, [routeFitToken]);
+
+  // Fit to bounds only once per route
   useEffect(() => {
     if (points.length === 0) return;
+    if (hasFitToRouteRef.current) return; // Already fitted for this route
 
     const bounds = L.latLngBounds(points.map(p => [p.lat, p.lng]));
     
@@ -60,6 +73,8 @@ function FitBounds({ points }: { points: RoutePoint[] }) {
       padding: [50, 50],
       maxZoom: 14,
     });
+    
+    hasFitToRouteRef.current = true;
   }, [map, points]);
 
   return null;
@@ -93,9 +108,10 @@ function MapSizeFixer() {
 interface RoutePlannerMapProps {
   points: RoutePoint[];
   routeCoordinates: [number, number][] | null; // [lng, lat] pairs from ORS
+  routeFitToken: number; // Incremented when a new route is requested, triggers one-time fit-to-bounds
 }
 
-export default function RoutePlannerMap({ points, routeCoordinates }: RoutePlannerMapProps) {
+export default function RoutePlannerMap({ points, routeCoordinates, routeFitToken }: RoutePlannerMapProps) {
   // Convert ORS coordinates [lng, lat] to Leaflet [lat, lng]
   const routeLatLngs = useMemo(() => {
     if (!routeCoordinates) return [];
@@ -134,7 +150,7 @@ export default function RoutePlannerMap({ points, routeCoordinates }: RoutePlann
       
       <MapSizeFixer />
       
-      {points.length > 0 && <FitBounds points={points} />}
+      {points.length > 0 && <FitBounds points={points} routeFitToken={routeFitToken} />}
 
       {/* Route polyline */}
       {routeLatLngs.length > 0 && (
