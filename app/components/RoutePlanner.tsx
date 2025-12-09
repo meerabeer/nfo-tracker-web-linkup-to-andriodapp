@@ -3,6 +3,15 @@
 import { useState, useMemo, useCallback, useEffect } from "react";
 import dynamic from "next/dynamic";
 import { SiteRecord, calculateDistanceKm, hasValidLocation, formatDistanceLabel } from "../lib/nfoHelpers";
+import { 
+  calculateBestRoute, 
+  calculateRouteWithWaypoints,
+  calculateRouteViaWarehouse,
+  type RouteResult as SharedRouteResult,
+  type MultiLegRouteResult,
+  type RouteEngine,
+  ROUTE_SANITY_RATIO_THRESHOLD,
+} from "../lib/routing";
 
 // Dynamic import for the map to avoid SSR issues
 const RoutePlannerMap = dynamic(() => import("./RoutePlannerMap"), {
@@ -13,70 +22,6 @@ const RoutePlannerMap = dynamic(() => import("./RoutePlannerMap"), {
     </div>
   ),
 });
-
-// ============================================================================
-// Haversine helper for straight-line distance calculation (Route Planner only)
-// ============================================================================
-function haversineKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371; // Earth's radius in km
-  const toRad = (deg: number) => (deg * Math.PI) / 180;
-
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-// ============================================================================
-// OSRM public API helper (fallback when ORS returns crazy routes)
-// ============================================================================
-async function fetchOsrmRoute(
-  startLat: number,
-  startLon: number,
-  endLat: number,
-  endLon: number
-): Promise<{ distanceKm: number; durationMin: number; coordinates: [number, number][] } | null> {
-  try {
-    // OSRM public endpoint (uses lon,lat order in URL)
-    const osrmUrl =
-      `https://router.project-osrm.org/route/v1/driving/` +
-      `${startLon},${startLat};${endLon},${endLat}` +
-      `?overview=full&geometries=geojson`;
-
-    console.log("RoutePlanner OSRM fallback URL:", osrmUrl);
-
-    const response = await fetch(osrmUrl);
-    const data = await response.json();
-
-    console.log("RoutePlanner OSRM response:", data);
-
-    if (data.code === "Ok" && data.routes && data.routes[0]) {
-      const route = data.routes[0];
-      // OSRM returns GeoJSON coordinates as [lng, lat] which is what we need
-      const coordinates: [number, number][] = route.geometry.coordinates;
-      return {
-        distanceKm: route.distance / 1000,
-        durationMin: route.duration / 60,
-        coordinates,
-      };
-    }
-    return null;
-  } catch (error) {
-    console.error("RoutePlanner OSRM fetch error:", error);
-    return null;
-  }
-}
-
-// Sanity check threshold: if ORS route distance > RATIO_THRESHOLD × direct distance, consider OSRM
-const ROUTE_SANITY_RATIO_THRESHOLD = 2.0;
 
 // Types
 export type WarehouseRecord = {
@@ -96,8 +41,8 @@ export type EnrichedNfoForRouting = {
   home_location: string | null;
 };
 
-// Engine type for route source tracking
-export type RouteEngineType = "ors" | "osrm";
+// Re-export RouteEngine from shared routing module for backwards compatibility
+export type RouteEngineType = RouteEngine;
 
 export type RouteResult = {
   coordinates: [number, number][]; // [lng, lat] pairs
@@ -105,8 +50,8 @@ export type RouteResult = {
   durationSeconds: number;
   viaWarehouse: boolean;
   warehouseName?: string;
-  isFallback?: boolean; // True if ORS couldn't route and we're showing straight-line
-  engine?: RouteEngineType; // Which routing engine produced this result
+  isFallback?: boolean; // True if routing engines couldn't find route
+  engine?: RouteEngine; // Which routing engine produced this result
   directDistanceKm?: number; // Straight-line distance for comparison
 };
 
@@ -280,8 +225,7 @@ export default function RoutePlanner({ nfos, sites, warehouses, state, onStateCh
     return points;
   }, [selectedNfo, selectedWarehouse, selectedSite]);
 
-  // Fetch route - ALWAYS compare ORS vs OSRM and pick the better one (Route Planner only)
-  // This ensures we don't show unnecessarily long routes when one engine has better data
+  // Fetch route using shared routing logic (ORS vs OSRM comparison)
   const fetchRoute = useCallback(async () => {
     if (!canRoute || !selectedNfo || !selectedSite) return;
 
@@ -292,182 +236,53 @@ export default function RoutePlanner({ nfos, sites, warehouses, state, onStateCh
     updateState({ routeResult: null });
 
     try {
-      // Build coordinates array: NFO -> (optional Warehouse) -> Site
-      // Format: [lng, lat] pairs as ORS expects
-      const coords: [number, number][] = [];
-      
-      coords.push([selectedNfo.lng!, selectedNfo.lat!]);
-      
       const hasWarehouse = selectedWarehouse && hasValidLocation({ lat: selectedWarehouse.latitude, lng: selectedWarehouse.longitude });
-      if (hasWarehouse) {
-        coords.push([selectedWarehouse.longitude!, selectedWarehouse.latitude!]);
-      }
-      
-      coords.push([selectedSite.longitude!, selectedSite.latitude!]);
-
-      // Calculate direct (straight-line) distance for sanity check
-      // For multi-leg routes (via warehouse), sum the direct distances
-      let directKm: number;
-      if (hasWarehouse) {
-        const leg1 = haversineKm(selectedNfo.lat!, selectedNfo.lng!, selectedWarehouse.latitude!, selectedWarehouse.longitude!);
-        const leg2 = haversineKm(selectedWarehouse.latitude!, selectedWarehouse.longitude!, selectedSite.latitude!, selectedSite.longitude!);
-        directKm = leg1 + leg2;
-      } else {
-        directKm = haversineKm(selectedNfo.lat!, selectedNfo.lng!, selectedSite.latitude!, selectedSite.longitude!);
-      }
 
       console.log("RoutePlanner fetchRoute", {
         nfo: { lat: selectedNfo.lat, lng: selectedNfo.lng },
         warehouse: hasWarehouse ? { lat: selectedWarehouse.latitude, lng: selectedWarehouse.longitude } : null,
         site: { lat: selectedSite.latitude, lng: selectedSite.longitude, id: selectedSite.site_id },
-        directDistanceKm: directKm,
       });
 
-      // Step 1: Call our ORS API route
-      const orsResponse = await fetch("/api/ors-route", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          coordinates: coords,
-          profile: "driving-car",
-        }),
-      });
+      let result: SharedRouteResult;
 
-      const orsData = await orsResponse.json();
-      console.log("RoutePlanner ORS response:", orsData);
-
-      // Extract ORS data (may be null if ORS failed)
-      let orsKm: number | null = null;
-      let orsMin: number | null = null;
-      let orsCoords: [number, number][] | null = null;
-
-      if (orsData.ok && orsData.route) {
-        orsKm = orsData.route.distanceMeters / 1000;
-        orsMin = orsData.route.durationSeconds / 60;
-        orsCoords = orsData.route.coordinates;
-        console.log("RoutePlanner ORS extracted:", { orsKm, orsMin });
+      if (hasWarehouse) {
+        // Route via warehouse - uses ORS+OSRM comparison per leg
+        const coords: [number, number][] = [
+          [selectedNfo.lng!, selectedNfo.lat!],
+          [selectedWarehouse.longitude!, selectedWarehouse.latitude!],
+          [selectedSite.longitude!, selectedSite.latitude!],
+        ];
+        result = await calculateRouteWithWaypoints(coords);
       } else {
-        console.log("RoutePlanner ORS failed or no route");
-      }
-
-      // Step 2: ALWAYS call OSRM for comparison (for direct routes without warehouse)
-      // OSRM public API doesn't support waypoints, so only for direct NFO→Site routes
-      let osrmKm: number | null = null;
-      let osrmMin: number | null = null;
-      let osrmCoords: [number, number][] | null = null;
-
-      if (!hasWarehouse) {
-        console.log("RoutePlanner: Calling OSRM for comparison...");
-        const osrmResult = await fetchOsrmRoute(
+        // Direct route - use best route comparison (ORS vs OSRM)
+        result = await calculateBestRoute(
           selectedNfo.lat!,
           selectedNfo.lng!,
           selectedSite.latitude!,
           selectedSite.longitude!
         );
-
-        if (osrmResult) {
-          osrmKm = osrmResult.distanceKm;
-          osrmMin = osrmResult.durationMin;
-          osrmCoords = osrmResult.coordinates;
-          console.log("RoutePlanner OSRM extracted:", { osrmKm, osrmMin });
-        } else {
-          console.log("RoutePlanner OSRM failed or no route");
-        }
       }
 
-      // Step 3: Choose the best engine
-      // Default to ORS, but switch to OSRM if it's shorter AND not crazy vs air distance
-      let finalEngine: RouteEngineType = "ors";
-      let finalKm: number;
-      let finalMin: number;
-      let finalCoords: [number, number][];
+      console.log("RoutePlanner route result:", result);
 
-      const orsRatio = orsKm != null ? orsKm / Math.max(directKm, 0.001) : null;
-      const osrmRatio = osrmKm != null ? osrmKm / Math.max(directKm, 0.001) : null;
-
-      console.log("RoutePlanner engine comparison:", {
-        orsKm,
-        orsRatio,
-        osrmKm,
-        osrmRatio,
-        directKm,
-      });
-
-      // If ORS has valid data, start with that
-      if (orsKm != null && orsCoords != null && orsMin != null) {
-        finalKm = orsKm;
-        finalMin = orsMin;
-        finalCoords = orsCoords;
-        finalEngine = "ors";
-
-        // Check if OSRM is better: shorter AND not crazy (ratio <= 2.0)
-        if (osrmKm != null && osrmCoords != null && osrmMin != null && osrmRatio != null) {
-          if (osrmKm < orsKm && osrmRatio <= ROUTE_SANITY_RATIO_THRESHOLD) {
-            finalKm = osrmKm;
-            finalMin = osrmMin;
-            finalCoords = osrmCoords;
-            finalEngine = "osrm";
-            console.log("RoutePlanner: Switching to OSRM (shorter and not crazy)");
-          }
-        }
-      } else if (osrmKm != null && osrmCoords != null && osrmMin != null) {
-        // ORS failed but OSRM worked
-        finalKm = osrmKm;
-        finalMin = osrmMin;
-        finalCoords = osrmCoords;
-        finalEngine = "osrm";
-        console.log("RoutePlanner: Using OSRM (ORS failed)");
-      } else {
-        // Both failed - show straight-line fallback
-        console.log("RoutePlanner: Both engines failed - using straight line fallback");
-        updateState({
-          routeResult: {
-            coordinates: coords,
-            distanceMeters: directKm * 1000,
-            durationSeconds: 0,
-            viaWarehouse: !!hasWarehouse,
-            warehouseName: selectedWarehouse?.name,
-            isFallback: true,
-            engine: "ors",
-            directDistanceKm: directKm,
-          },
-        });
-        setRouteLoading(false);
-        return;
-      }
-
-      // Step 4: Warning logic - warn if chosen engine distance > 2× air distance
-      const finalRatio = finalKm / Math.max(directKm, 0.001);
-      let warning: string | null = null;
-
-      if (finalRatio > ROUTE_SANITY_RATIO_THRESHOLD) {
-        warning = `Warning: driving distance is ${finalKm.toFixed(1)} km vs straight-line ${directKm.toFixed(1)} km. Map data may be inaccurate in this area.`;
-      }
-
-      console.log("RoutePlanner final decision:", {
-        engine: finalEngine,
-        finalKm,
-        finalMin,
-        finalRatio,
-        hasWarning: !!warning,
-      });
-
-      // Set the final result
-      setRouteWarning(warning);
+      // Set warning if present
+      setRouteWarning(result.warning ?? null);
       
       // Increment fit token to trigger one-time fit-to-bounds for this new route
       setRouteFitToken((t) => t + 1);
       
+      // Update state with result
       updateState({
         routeResult: {
-          coordinates: finalCoords,
-          distanceMeters: finalKm * 1000,
-          durationSeconds: finalMin * 60,
+          coordinates: result.coordinates,
+          distanceMeters: result.distanceKm * 1000,
+          durationSeconds: result.durationMin * 60,
           viaWarehouse: !!hasWarehouse,
           warehouseName: selectedWarehouse?.name,
-          isFallback: false,
-          engine: finalEngine,
-          directDistanceKm: directKm,
+          isFallback: result.isFallback ?? false,
+          engine: result.engine,
+          directDistanceKm: result.airDistanceKm,
         },
       });
     } catch (error) {

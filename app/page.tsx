@@ -19,6 +19,7 @@ import LiveMap from "./components/LiveMap";
 import NfoRoutesView from "./components/NfoRoutesView";
 import RoutePlanner from "./components/RoutePlanner";
 import type { WarehouseRecord, RoutePlannerState } from "./components/RoutePlanner";
+import { calculateBestRoute, calculateRouteWithWaypoints, type RouteResult as SharedRouteResult, type RouteEngine } from "./lib/routing";
 
 const STUCK_MINUTES = 150; // 2.5 hours
 const REFRESH_INTERVAL_MS = 30_000; // 30 seconds auto-refresh
@@ -134,7 +135,9 @@ interface RowRouteResult {
   distanceKm: number;
   durationMin: number | null; // null for fallback (straight-line)
   viaWarehouse: string | null; // warehouse name if routed via warehouse
-  isFallback?: boolean; // true if ORS couldn't route
+  isFallback?: boolean; // true if routing engines couldn't find route
+  engine?: RouteEngine; // "ors" or "osrm" - which engine produced the result
+  warning?: string; // warning if route seems suspicious (> 2x air distance)
 }
 
 function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps) {
@@ -186,59 +189,42 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
           )
         : null;
 
-      // Build coordinates array: NFO -> (optional Warehouse) -> Site
-      // Format: [lng, lat] pairs as ORS expects
-      const coords: [number, number][] = [[nfoPoint.lng, nfoPoint.lat]];
-      if (matchingWarehouse) {
-        coords.push([matchingWarehouse.longitude!, matchingWarehouse.latitude!]);
-      }
-      coords.push([sitePoint.lng, sitePoint.lat]);
-
-      // Debug logging: log coordinates being sent
-      console.log("FieldEngineerRow route coords", {
+      // Debug logging
+      console.log("FieldEngineerRow route request", {
         username: enriched.username,
         nfo: nfoPoint,
         warehouse: matchingWarehouse ? { lat: matchingWarehouse.latitude, lng: matchingWarehouse.longitude, name: matchingWarehouse.name } : null,
         site: { ...sitePoint, id: targetSite.site_id },
-        coordsArray: coords,
       });
 
-      // Call our API route which handles ORS with increased search radius
-      const response = await fetch("/api/ors-route", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          coordinates: coords,
-          profile: "driving-car",
-        }),
-      });
+      let result: SharedRouteResult;
 
-      const data = await response.json();
-      console.log("FieldEngineerRow API response:", data);
-
-      // Check if ORS could build a route
-      if (!data.ok) {
-        // ORS could not build a proper driving route even with larger radius.
-        // Fallback: use air distance and show neutral message
-        console.log("FieldEngineerRow ORS fallback - using air distance");
-        
-        // Use the pre-computed air distance from enriched
-        setRouteResult({
-          distanceKm: enriched.airDistanceKm ?? 0,
-          durationMin: null, // Unknown for straight line
-          viaWarehouse: matchingWarehouse ? matchingWarehouse.name : null,
-          isFallback: true,
-        });
-        // Don't set routeError - keep it neutral
-        return;
+      if (matchingWarehouse) {
+        // Route via warehouse - uses ORS+OSRM comparison per leg (same as Route Planner)
+        const coords: [number, number][] = [
+          [nfoPoint.lng, nfoPoint.lat],
+          [matchingWarehouse.longitude!, matchingWarehouse.latitude!],
+          [sitePoint.lng, sitePoint.lat],
+        ];
+        result = await calculateRouteWithWaypoints(coords);
+      } else {
+        // Direct route - use best route comparison (ORS vs OSRM)
+        result = await calculateBestRoute(
+          nfoPoint.lat,
+          nfoPoint.lng,
+          sitePoint.lat,
+          sitePoint.lng
+        );
       }
 
-      // Success - use the route from ORS
+      // Store result
       setRouteResult({
-        distanceKm: data.route.distanceMeters / 1000,
-        durationMin: data.route.durationSeconds / 60,
+        distanceKm: result.distanceKm,
+        durationMin: result.isFallback ? null : result.durationMin,
         viaWarehouse: matchingWarehouse ? matchingWarehouse.name : null,
-        isFallback: false,
+        isFallback: result.isFallback,
+        engine: result.engine,
+        warning: result.warning,
       });
     } catch (err) {
       // Only show error for actual failures (like missing GPS)
@@ -265,12 +251,14 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
       return `${distStr} km (air)`;
     }
     
-    // Normal ORS route: show distance and ETA
+    // Normal route: show distance, ETA, and engine
     const durationStr = Math.round(result.durationMin ?? 0);
+    const engineStr = result.engine ? ` (${result.engine.toUpperCase()})` : "";
+    
     if (result.viaWarehouse) {
-      return `${distStr} km, ${durationStr} min via ${result.viaWarehouse}`;
+      return `${distStr} km, ${durationStr} min${engineStr} via ${result.viaWarehouse}`;
     }
-    return `${distStr} km, ${durationStr} min`;
+    return `${distStr} km, ${durationStr} min${engineStr}`;
   };
 
   return (
@@ -317,9 +305,16 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
             )}
           </div>
           {routeResult && (
-            <span className={`text-xs ${routeResult.isFallback ? "text-amber-600" : "text-green-700"}`}>
-              {formatRouteSummary(routeResult)}
-            </span>
+            <div className="flex flex-col gap-0.5">
+              <span className={`text-xs ${routeResult.isFallback ? "text-amber-600" : "text-green-700"}`}>
+                {formatRouteSummary(routeResult)}
+              </span>
+              {routeResult.warning && (
+                <span className="text-[10px] text-orange-600 leading-tight">
+                  ⚠️ {routeResult.warning}
+                </span>
+              )}
+            </div>
           )}
           {routeError && (
             <span className="text-red-600 text-xs">{routeError}</span>
