@@ -19,7 +19,14 @@ import LiveMap from "./components/LiveMap";
 import NfoRoutesView from "./components/NfoRoutesView";
 import RoutePlanner from "./components/RoutePlanner";
 import type { WarehouseRecord, RoutePlannerState } from "./components/RoutePlanner";
-import { calculateBestRoute, calculateRouteWithWaypoints, type RouteResult as SharedRouteResult, type RouteEngine } from "./lib/routing";
+import { 
+  calculateBestRoute, 
+  calculateRouteViaWarehouse, 
+  type RouteResult as SharedRouteResult, 
+  type RouteEngine,
+  type EngineRouteData,
+  ROUTE_SANITY_RATIO_THRESHOLD,
+} from "./lib/routing";
 
 const STUCK_MINUTES = 150; // 2.5 hours
 const REFRESH_INTERVAL_MS = 30_000; // 30 seconds auto-refresh
@@ -138,6 +145,10 @@ interface RowRouteResult {
   isFallback?: boolean; // true if routing engines couldn't find route
   engine?: RouteEngine; // "ors" or "osrm" - which engine produced the result
   warning?: string; // warning if route seems suspicious (> 2x air distance)
+  airDistanceKm?: number; // air distance for alternative route ratio check
+  // Alternative engine results for switching
+  orsResult?: EngineRouteData;
+  osrmResult?: EngineRouteData;
 }
 
 function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps) {
@@ -200,13 +211,15 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
       let result: SharedRouteResult;
 
       if (matchingWarehouse) {
-        // Route via warehouse - uses ORS+OSRM comparison per leg (same as Route Planner)
-        const coords: [number, number][] = [
-          [nfoPoint.lng, nfoPoint.lat],
-          [matchingWarehouse.longitude!, matchingWarehouse.latitude!],
-          [sitePoint.lng, sitePoint.lat],
-        ];
-        result = await calculateRouteWithWaypoints(coords);
+        // Route via warehouse - uses ORS+OSRM comparison per leg with combined alternatives
+        result = await calculateRouteViaWarehouse(
+          nfoPoint.lat,
+          nfoPoint.lng,
+          matchingWarehouse.latitude!,
+          matchingWarehouse.longitude!,
+          sitePoint.lat,
+          sitePoint.lng
+        );
       } else {
         // Direct route - use best route comparison (ORS vs OSRM)
         result = await calculateBestRoute(
@@ -217,7 +230,7 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
         );
       }
 
-      // Store result
+      // Store result with alternative engine data
       setRouteResult({
         distanceKm: result.distanceKm,
         durationMin: result.isFallback ? null : result.durationMin,
@@ -225,6 +238,9 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
         isFallback: result.isFallback,
         engine: result.engine,
         warning: result.warning,
+        airDistanceKm: result.airDistanceKm,
+        orsResult: result.orsResult,
+        osrmResult: result.osrmResult,
       });
     } catch (err) {
       // Only show error for actual failures (like missing GPS)
@@ -238,6 +254,65 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
     setRouteResult(null);
     setRouteError(null);
   };
+
+  // Switch to alternative engine (ORS ↔ OSRM)
+  const switchToAlternativeEngine = (targetEngine: RouteEngine) => {
+    if (!routeResult) return;
+    
+    const alternativeData = targetEngine === "osrm" ? routeResult.osrmResult : routeResult.orsResult;
+    if (!alternativeData) return;
+    
+    // Calculate new warning based on alternative route
+    const airKm = routeResult.airDistanceKm ?? 0;
+    const ratio = alternativeData.distanceKm / Math.max(airKm, 0.001);
+    const newWarning = ratio > ROUTE_SANITY_RATIO_THRESHOLD
+      ? `Driving distance is ${alternativeData.distanceKm.toFixed(1)} km vs straight-line ${airKm.toFixed(1)} km. Map data may be inaccurate in this area.`
+      : undefined;
+    
+    // Update route result with alternative engine's data
+    setRouteResult({
+      ...routeResult,
+      distanceKm: alternativeData.distanceKm,
+      durationMin: alternativeData.durationMin,
+      engine: targetEngine,
+      warning: newWarning,
+    });
+  };
+
+  // Compute alternative route info (if available)
+  const alternativeRoute = useMemo(() => {
+    if (!routeResult || routeResult.isFallback) return null;
+    
+    const currentEngine = routeResult.engine;
+    const alternativeEngine = currentEngine === "ors" ? "osrm" : "ors";
+    const alternativeData = alternativeEngine === "osrm" ? routeResult.osrmResult : routeResult.orsResult;
+    
+    if (!alternativeData) return null;
+    
+    // Calculate if alternative looks different enough to show
+    const currentKm = routeResult.distanceKm;
+    const altKm = alternativeData.distanceKm;
+    const diffPercent = Math.abs(currentKm - altKm) / Math.max(currentKm, 0.001) * 100;
+    
+    // Check if alternative has warning
+    const airKm = routeResult.airDistanceKm ?? 0;
+    const altRatio = altKm / Math.max(airKm, 0.001);
+    const altHasWarning = altRatio > ROUTE_SANITY_RATIO_THRESHOLD;
+    const currentHasWarning = !!routeResult.warning;
+    
+    // Show alternative if: current has warning OR significant difference (> 10%)
+    const shouldShow = currentHasWarning || diffPercent > 10;
+    
+    if (!shouldShow) return null;
+    
+    return {
+      engine: alternativeEngine as RouteEngine,
+      distanceKm: altKm,
+      durationMin: alternativeData.durationMin,
+      hasWarning: altHasWarning,
+      isRecommended: currentHasWarning && !altHasWarning,
+    };
+  }, [routeResult]);
 
   // Format route summary
   const formatRouteSummary = (result: RowRouteResult): string => {
@@ -313,6 +388,31 @@ function FieldEngineerRow({ enriched, sites, warehouses }: FieldEngineerRowProps
                 <span className="text-[10px] text-orange-600 leading-tight">
                   ⚠️ {routeResult.warning}
                 </span>
+              )}
+              {/* Alternative route option */}
+              {alternativeRoute && (
+                <div className={`mt-1 p-1.5 rounded text-[10px] ${
+                  alternativeRoute.isRecommended 
+                    ? "bg-purple-50 border border-purple-200" 
+                    : "bg-gray-50 border border-gray-200"
+                }`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={alternativeRoute.isRecommended ? "text-purple-700" : "text-gray-600"}>
+                      {alternativeRoute.isRecommended ? "💡" : "Alt:"} {alternativeRoute.engine.toUpperCase()}: {alternativeRoute.distanceKm.toFixed(1)} km, {Math.round(alternativeRoute.durationMin)} min
+                      {alternativeRoute.hasWarning && <span className="text-orange-500 ml-1">⚠️</span>}
+                    </span>
+                    <button
+                      onClick={() => switchToAlternativeEngine(alternativeRoute.engine)}
+                      className={`px-1.5 py-0.5 rounded text-[9px] font-medium ${
+                        alternativeRoute.isRecommended
+                          ? "bg-purple-600 text-white hover:bg-purple-700"
+                          : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+                      }`}
+                    >
+                      Use
+                    </button>
+                  </div>
+                </div>
               )}
             </div>
           )}
