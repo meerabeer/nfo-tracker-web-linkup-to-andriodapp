@@ -1281,7 +1281,7 @@ export default function HomePage() {
             {/* Simple list of current NFO statuses */}
             <section className="bg-white rounded-xl shadow p-4">
               <h2 className="text-lg font-semibold mb-3">
-                Field engineers (latest status per username)
+                Field Engineers ( Status )
               </h2>
               <div className="flex flex-wrap items-center gap-3 mb-4 text-sm">
                 <input
