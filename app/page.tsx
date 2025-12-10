@@ -1113,7 +1113,7 @@ export default function HomePage() {
           <div className="max-w-5xl mx-auto space-y-6">
             <header className="flex items-center justify-between">
               <h1 className="text-2xl font-bold">
-                NFO Manager Dashboard (Web v0)
+                Dashboard
               </h1>
               <div className="text-right">
                 <span className="text-xs text-gray-500 block">
